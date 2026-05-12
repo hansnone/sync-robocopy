@@ -1,0 +1,519 @@
+## Información necesaria para generar un prompt técnico sólido para el programa Rust
+
+Para redactar un prompt completo y usable para crear el programa en Rust, necesito cerrar requisitos en estas áreas:
+
+1.  **entorno Windows/NAS**;
+2.  **modelo exacto de transferencia**;
+3.  **rendimiento objetivo para 10 GbE**;
+4.  **semántica append-only**;
+5.  **verificación de integridad**;
+6.  **metadatos**;
+7.  **credenciales y montaje `R:`**;
+8.  **logging, métricas y operación**;
+9.  **estructura del proyecto Rust**.
+
+La clave es no pedir “un clon de Robocopy”, sino un **motor Rust especializado para ingesta local → NAS**, optimizado para red de 10 GbE.
+
+***
+
+## 1. Datos del entorno
+
+Necesito estos datos:
+
+*   Versión de Windows: Windows 11. La ultima version.
+*   Versión de PowerShell disponible, si seguirá usándose para instalación o tarea. La 5. Creo que es la que viene por defecto.
+*   Equipo cliente: No podria darte datos precisos del sistema. Pero es un ordenador de alta gama, muy alta. Usado para IA local para generacion de video, foto y audio. Intel i9 y una nvidia 5090. Mas menos.
+*   NAS: No tengo forma de saberlo.
+*   Red: Velociad real punto a punto de 10 gigas. Entorno de produccion muy serio.
+
+Motivo: para saturar 10 GbE no basta con multihilo. El límite puede estar en disco origen, NAS, SMB, CPU, antivirus, tamaño de archivos o configuración de red. Se usan discos en local NVME y SSD en NAS.
+
+***
+
+## 2. Rutas y montaje
+
+Confirmar: Si, confirmo. Aunque a lo mejor tendria que cambiar la ruta. Para la gestion de carpetas y directorios de diferentes equipos de operadores.
+
+*   Ruta local origen definitiva.
+*   Recurso NAS definitivo:
+    *   `\\RAW-NAS\Repositorio`
+*   IP:
+    *   `10.71.11.41`
+*   Unidad obligatoria:
+    *   `R:\`
+*   Si `R:` debe:
+    *   montarse siempre al arrancar;
+    *   validarse en cada ciclo;
+    *   remapearse automáticamente si apunta mal;
+    *   no tocarse si ya existe pero apunta a otra cosa.
+
+
+También necesito saber si el programa Rust debe usar:
+
+*   `net use` como comando externo;
+*   APIs Windows `WNetAddConnection2/WNetAddConnection3`;
+*   ambos, con fallback. Quiero ambos.
+
+Técnicamente, Rust puede usar APIs WNet para conectar una unidad local como `R:` a un recurso remoto SMB; `WNetAddConnection2` permite redirigir un dispositivo local a un recurso de red, y `WNetAddConnection3` permite además asociar ventanas de diálogo del proveedor de red.
+***
+
+## 3. Credenciales
+
+Necesito definir el comportamiento exacto:
+
+*   ¿El programa se ejecutará siempre en sesión interactiva? No.
+*   ¿Debe pedir usuario/contraseña si falla el montaje? Si.
+*   ¿Formato esperado del usuario?
+    *   `DOMINIO\usuario`
+    *   `usuario@dominio`
+*   ¿Se permite guardar credenciales?
+    *   nunca guardar.
+*   ¿Debe permitir cancelar si no se introducen credenciales? Si.
+*   ¿Debe reintentar el prompt tras fallo de contraseña? Si.
+*   Número máximo de intentos de credenciales. Ni idea, 3.
+
+Para Kerberos, conviene priorizar `\\RAW-NAS\Repositorio`, no la IP, salvo configuración específica para SPN por IP. En principio por RAW-NAS.
+
+***
+
+## 4. Modelo funcional exacto
+
+Confirmar si el comportamiento deseado es:
+
+```text
+Mover desde origen local hacia NAS.
+Nunca borrar nada del destino.
+Nunca sobrescribir destino existente.
+Eliminar del origen solo tras copia verificada.
+```
+
+Necesito que confirmes estas decisiones:
+
+### Si el archivo ya existe en destino con el mismo nombre
+
+Opciones:
+
+
+4.  Comparar hash y, si es idéntico, borrar origen. Y si no moverlo al nas. A lo mejor tienen que trabajar sobre ese archivo y van guardando diferentes modificaciones.
+
+
+Mi recomendación para append-only estricto:
+
+```text
+Si destino existe, no tocar destino.
+Si hash/tamaño coincide y se habilita deduplicación segura, borrar origen opcionalmente.
+Si difiere, dejar origen y registrar conflicto.
+```
+
+***
+
+## 5. Tipología de archivos
+
+Necesito saber:
+
+*   Tamaño típico de archivos: Mezcla. Desde imagenes, videos, textos, archivos de modelos 3D, etc. Sueltos, en carpetas, en carpetas dentro de carpetas, etc.
+*   Tamaño medio aproximado: Pesados.
+*   Tamaño máximo esperado. ni idea
+*   Número aproximado de archivos por día. Ni idea, depende de la carga de trabajo.
+*   Número máximo de archivos acumulados en cola. Depende de ese dia.
+*   Profundidad de carpetas. No podria expecificarte. Conociendo como organizan los proyectos, espero que sea muy profundo.
+*   Si hay nombres largos o rutas superiores a 260 caracteres. Por casos concretos que he visto, puedo decirte que si.
+*   Si hay caracteres especiales, tildes, Unicode, etc. En princio no, la mayoria se suele nombrar en ingles.
+
+Esto condiciona el diseño:
+
+*   muchos archivos pequeños → más workers, batching, reducción de syscalls;
+*   archivos grandes → buffer grande, I/O secuencial, quizá menos workers;
+*   mezcla → scheduler adaptativo.
+
+***
+
+## 6. Rendimiento objetivo para 10 GbE
+
+Una red de 10 GbE tiene un máximo teórico aproximado de:
+
+```text
+10 Gbit/s ≈ 1.25 GB/s ≈ 1.164 GiB/s
+```
+
+En la práctica, con SMB y NAS, un objetivo razonable puede ser:
+
+```text
+700 MB/s - 1.100 MB/s
+```
+
+si el disco origen, NAS y configuración SMB acompañan.
+
+Necesito que definas:
+
+* En principio un equilibrio entre consumo y velocidad. Pero apuntando a lo maximo que se pueda de velocidad. 
+
+***
+
+## 7. Estrategia de copia
+
+Necesito decidir el diseño interno:
+
+
+
+### Opción C — Híbrida: me quedo con esta opcion.
+
+Recomendada:
+
+*   varios workers para archivos distintos;
+*   archivos grandes copiados con buffers grandes;
+*   opcionalmente modo experimental de segmentación.
+
+Mi recomendación inicial:
+
+```text
+Worker pool configurable + copia por bloques grandes + archivo temporal + rename atómico lógico.
+```
+
+***
+
+## 8. Tamaño de buffer
+
+Para 10 GbE, necesito saber si quieres que el prompt pida implementar buffers configurables. Buffer de tamaño medio / normal.
+
+***
+
+## 9. Verificación de integridad
+
+Necesito elegir nivel:
+
+
+
+### Nivel 3 — Fuerte -> Me quedo con esta opcion.
+
+*   hash completo origen;
+*   hash completo destino;
+*   borrar origen solo si coincide.
+
+Para 10 GbE, el hash completo puede penalizar mucho porque duplica lecturas. Recomendación:
+
+```text
+Modo por defecto: tamaño + flush + metadata.
+Modo auditoría opcional: BLAKE3/SHA-256.
+```
+
+***
+
+## 10. Archivos en escritura
+
+Necesito saber cómo se generan los archivos en origen.
+
+Opciones:
+
+*   los productores escriben directamente el nombre final;
+*   escriben `.tmp` y luego renombran al final;
+*   hay archivos que pueden estar abiertos durante minutos;
+*   hay bases de datos o ficheros vivos.
+
+Recomendación fuerte:
+
+```text
+El productor debe escribir .tmp y renombrar al nombre final solo cuando termine.
+El motor debe excluir *.tmp.
+```
+
+Si no se puede garantizar, el programa debe implementar una política de estabilidad:
+
+```text
+Copiar solo archivos cuyo tamaño y LastWriteTime no hayan cambiado durante X segundos.
+```
+
+Necesito el valor:
+
+```text
+FileStableSeconds = ?
+```
+
+Ejemplo: 10, 30, 60 segundos.
+
+Esto es algo a tener muy en cuenta. Por que a lo mejor un archivo lo estan viendo o editando en otro programa y se lo quito de su ordenador. Quiero respaldar archivos que se queden inactivos. Y a medida que se vayan modificando, irlos guardando pero sin borrarlos.
+
+***
+
+## 11. Metadatos a preservar
+
+Confirmar qué se debe preservar:
+
+*   datos;
+*   atributos;
+*   fecha de modificación;
+*   fecha de creación;
+*   fecha de último acceso;
+
+Con esto me vale.
+
+Para una primera versión Rust sin Robocopy, recomiendo:
+
+```text
+Datos + atributos + timestamps.
+No ACL/Owner/SACL en v1.
+```
+
+Copiar ACL, propietario y auditoría en Windows implica trabajar con descriptores de seguridad mediante APIs como `GetNamedSecurityInfo` y equivalentes de escritura, con permisos específicos y posibles incompatibilidades en NAS. [\[lazyadmin.nl\]](https://lazyadmin.nl/it/robocopy-ultimate-guide/), [\[dlightdaily.com\]](https://dlightdaily.com/robocopy-logging-explained-how-to-track-file-transfers-with-log-and-tee/)
+
+***
+
+## 12. Tratamiento de directorios
+
+Confirmar:
+
+*   ¿Debe crear directorios vacíos en destino? Debe mantener la jerarquia de existir.
+*   ¿Debe eliminar directorios vacíos del origen tras mover archivos? Si.
+*   ¿Debe preservar timestamps de directorios? No se a que te refieres.
+*   ¿Debe excluir junctions/symlinks? Si.
+*   ¿Debe seguir enlaces simbólicos o ignorarlos? Ignorarlos.
+
+Recomendación:
+
+```text
+Crear directorios necesarios en destino.
+No seguir junctions/symlinks.
+Eliminar directorios vacíos del origen si quedan vacíos tras mover.
+No borrar nunca nada del destino.
+```
+
+***
+
+## 13. Exclusiones
+
+Confirmar lista final:
+
+Directorios:
+
+```text
+.stfolder
+.stversions
+$RECYCLE.BIN
+System Volume Information
+.Trashes
+.Spotlight-V100
+.fseventsd
+```
+
+Archivos:
+
+```text
+*.tmp
+~*.*
+Thumbs.db
+.DS_Store
+desktop.ini
+*.ffs_lock
+*.ffs_db
+```
+
+Añadir si aplica:
+
+```text
+*.partial
+*.download
+*.crdownload
+*.lock
+*.lck
+```
+
+***
+
+## 14. Errores y reintentos
+
+Necesito definir:
+
+*   reintentos por archivo; 
+*   espera entre reintentos; 
+*   backoff progresivo;
+*   reintentos para NAS caído;
+*   pausa tras error;
+*   pausa tras errores consecutivos;
+*   si un archivo fallido bloquea el ciclo o se salta y continúa.
+
+Recomendación:
+
+```text
+RetriesPerFile = 3
+RetryDelay = 2s, 5s, 15s
+NasRetryDelay = 60s
+PersistentErrorDelay = 300s
+ContinueOnFileError = true
+```
+La recomendacion me parece bien.
+
+***
+
+## 15. Logging y métricas
+
+Confirmar formatos deseados:
+
+*   log humano `.log`;
+*   CSV de estadísticas;
+*   JSON Lines para eventos;
+*   resumen diario;
+*   rotación por tamaño;
+*   retención por número de archivos;
+*   retención por días.
+
+Métricas por archivo:
+
+```text
+ruta_relativa
+tamaño_bytes
+tiempo_copia_ms
+velocidad_MBps
+reintentos
+estado
+error_si_aplica
+```
+
+Métricas por ciclo:
+
+```text
+archivos_detectados
+archivos_movidos
+archivos_en_conflicto
+archivos_con_error
+bytes_movidos
+duración
+velocidad_media
+velocidad_pico
+```
+
+Métricas acumuladas:
+
+```text
+total_archivos
+total_bytes
+velocidad_media_global
+uptime
+errores_consecutivos
+```
+Me parece bien.
+
+***
+
+## 16. Interfaz de operación
+
+
+
+### App con icono en bandeja -> Por desgracia me quedo con esta opcion.
+
+Más profesional, pero más compleja:
+
+*   estado verde/rojo;
+*   botón montar NAS;
+*   botón parar;
+*   ver log;
+*   métricas.
+
+***
+
+## 17. Configuración externa
+
+Confirmar formato:
+
+*   TOML; <- Este.
+
+Recomendación:
+
+```text
+TOML
+```
+
+Más legible para configuración operativa.
+
+Ejemplo conceptual:
+
+```toml
+[source]
+path = "C:\\ColaEntrada"
+
+[nas]
+drive = "R:"
+primary_unc = "\\\\RAW-NAS\\Repositorio"
+fallback_unc = "\\\\10.71.11.41\\Repositorio"
+allow_ip_fallback = false
+
+[copy]
+workers = 8
+buffer_mib = 16
+strict_append_only = true
+verify_mode = "size"
+stable_seconds = 30
+```
+Aqui los nombres ponlos completos. Por si acaso alguna persona no familiarizada quiere cambiarlo.
+
+***
+
+## 18. Instalación y despliegue
+
+Necesito saber:
+
+*   ¿Se instalará en un único equipo o varios? uno
+*   ¿Debe generar automáticamente la tarea programada? Si, y con opciones. Las que se puedan.
+*   ¿Debe venir con instalador? Mas adelante.
+*   ¿Debe funcionar sin privilegios de administrador? Sin privilegios.
+*   ¿Debe ejecutarse con privilegios elevados? No.
+*   ¿Debe tener firma de código? Si es importante.
+*   ¿Hay EDR/antivirus corporativo que pueda bloquear binarios nuevos? En principio no.
+
+***
+
+## 19. Respuestas mínimas que necesito de ti
+
+Puedes responder directamente rellenando esto:
+
+```text
+1. Windows:
+2. Origen local definitivo:
+3. NAS UNC:
+4. Share real:
+5. Unidad obligatoria:
+6. ¿Permitir fallback por IP?: sí/no
+7. ¿Guardar credenciales?: no / Credential Manager / persistencia SMB
+8. ¿Archivos grandes, pequeños o mezcla?:
+9. Tamaño medio:
+10. Tamaño máximo:
+11. Archivos por día aprox.:
+12. Disco local origen: HDD / SATA SSD / NVMe
+13. NAS tiene SSD/HDD/RAID?:
+14. Objetivo de velocidad mínimo:
+15. Objetivo ideal:
+16. Workers máximos permitidos:
+17. Buffer por worker preferido:
+18. Verificación: tamaño / hash opcional / hash obligatorio
+19. ¿Productores escriben .tmp y renombran?: sí/no/no seguro
+20. StableSeconds si no hay .tmp:
+21. Preservar ACL/propietario/auditoría?: sí/no
+22. Eliminar directorios vacíos del origen: sí/no
+23. Formato config: TOML/JSON/YAML
+24. Logs: log + CSV / log + CSV + JSONL
+25. Interfaz: CLI / CLI con prompt / tray icon
+26. Tarea programada interactiva: sí/no
+27. ¿Debe crear la tarea automáticamente?: sí/no
+28. ¿Debe generar instalador?: sí/no
+```
+
+***
+
+## Recomendación para el prompt final
+
+Cuando me des esos datos, puedo generarte un prompt con esta estructura:
+
+1.  **rol del modelo**: arquitecto Rust senior Windows;
+2.  **objetivo funcional**;
+3.  **restricciones de seguridad**;
+4.  **requisitos de rendimiento 10 GbE**;
+5.  **diseño del motor de copia**;
+6.  **diseño de concurrencia**;
+7.  **gestión de NAS y Kerberos**;
+8.  **modelo de errores**;
+9.  **logging y métricas**;
+10. **estructura del proyecto Cargo**;
+11. **criterios de aceptación**;
+12. **plan de pruebas**;
+13. **entregables esperados**.
+
+Con esa información, el prompt puede pedir no solo “código”, sino una solución mantenible: arquitectura, módulos, configuración, pruebas y binario operable.
