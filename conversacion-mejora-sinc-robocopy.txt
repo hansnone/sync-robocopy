@@ -1,0 +1,1000 @@
+Versión preliminar
+Pedro De Cabo
+
+You said:
+# =============================================
+# Sincronización Robocopy Mirror Continua - v4
+# Versión endurecida con:
+#  - Exclusiones de metadatos (Syncthing, macOS, Windows)
+#  - Rotación automática de log
+#  - Detección y registro de errores
+#  - Reintentos optimizados
+#  - Pausa adaptativa según actividad
+#  - version 0.0.4
+# =============================================
+
+# ---------- Configuración ----------
+$origen  = "C:\Users\locadmin\Desktop\prueba-sincronizacion-carpetas\carpeta-a"
+$destino = "C:\Users\locadmin\Desktop\prueba-sincronizacion-carpetas\carpeta-b"
+$log     = "$env:USERPROFILE\Documents\robocopy-sync.log"
+
+# Tamaño máximo del log antes de rotar (en bytes)
+$maxLogSize = 50MB
+
+# Exclusiones: metadatos de Syncthing, macOS, Windows y temporales
+$excludeDirs = @(
+'.stfolder',                    # Syncthing marker
+'.stversions',                  # Syncthing versioning
+'$RECYCLE.BIN',                 # Papelera Windows
+'System Volume Information',    # Metadata NTFS
+'.Trashes',                     # macOS
+'.Spotlight-V100',              # macOS
+'.fseventsd'                    # macOS
+)
+
+$excludeFiles = @(
+'*.tmp',
+'~*.*',
+'Thumbs.db',
+'.DS_Store',
+'desktop.ini',
+'*.ffs_lock',                   # FreeFileSync lock
+'*.ffs_db'                      # FreeFileSync database
+)
+
+# Pausa entre ciclos (segundos)
+$pausaNormal = 15      # Cuando no hay cambios
+$pausaTrasError = 60   # Cuando hay error grave
+$pausaTrasCambio = 10  # Justo después de copiar algo
+
+# ---------- Funciones auxiliares ----------
+function Write-Log {
+param([string]$mensaje, [string]$nivel = "INFO")
+$ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+"$ts [$nivel] $mensaje" | Out-File $log -Append -Encoding UTF8
+}
+
+function Rotar-LogSiNecesario {
+if ((Test-Path $log) -and (Get-Item $log).Length -gt $maxLogSize) {
+    $archivado = "$log.$(Get-Date -Format 'yyyyMMdd_HHmmss').old"
+    Move-Item $log $archivado -Force
+    "=== Log rotado desde: $archivado ===" | Out-File $log -Encoding UTF8
+    Write-Log "Log rotado. Archivo anterior: $archivado"
+}
+}
+
+function Interpretar-ExitCode {
+param([int]$code)
+# Códigos Robocopy (bitmask):
+#  0 = Sin cambios
+#  1 = OK, ficheros copiados
+#  2 = Extras detectados/eliminados
+#  4 = Mismatches
+#  8 = Fallos de copia
+# 16 = Error fatal
+$mensajes = @()
+if ($code -eq 0)       { $mensajes += "Sin cambios" }
+if ($code -band 1)     { $mensajes += "Copiados OK" }
+if ($code -band 2)     { $mensajes += "Extras procesados" }
+if ($code -band 4)     { $mensajes += "⚠ Mismatches" }
+if ($code -band 8)     { $mensajes += "✗ Fallos de copia" }
+if ($code -band 16)    { $mensajes += "✗✗ ERROR FATAL" }
+return ($mensajes -join ", ")
+}
+
+# ---------- Validaciones iniciales ----------
+if (-not (Test-Path $origen)) {
+Write-Host "ERROR: No existe el origen: $origen" -ForegroundColor Red
+exit 1
+}
+if (-not (Test-Path $destino)) {
+Write-Host "Creando destino: $destino" -ForegroundColor Yellow
+New-Item -ItemType Directory -Path $destino -Force | Out-Null
+}
+
+# ---------- Cabecera inicial ----------
+if (-not (Test-Path $log)) {
+"=== Robocopy Sync Started: $(Get-Date) ===" | Out-File $log -Encoding UTF8
+}
+Write-Log "================ INICIO DEL SERVICIO ================"
+Write-Log "Origen : $origen"
+Write-Log "Destino: $destino"
+Write-Log "Exclusiones dir : $($excludeDirs -join ', ')"
+Write-Log "Exclusiones file: $($excludeFiles -join ', ')"
+Write-Log "====================================================="
+
+# ---------- Bucle principal ----------
+$ciclo = 0
+$erroresConsecutivos = 0
+
+while ($true) {
+$ciclo++
+Rotar-LogSiNecesario
+
+Write-Log "--- Ciclo #$ciclo iniciado ---"
+
+# Ejecutar Robocopy
+# Parámetros clave:
+#   /MIR         -> espejo completo (copia + borra extras)
+#   /COPY:DAT    -> Data, Attributes, Timestamps (SIN Owner/Security -> evita error 1307)
+#   /DCOPY:T     -> preserva timestamps de directorios
+#   /MT:16       -> 16 hilos (balanceado para escritorio)
+#   /R:1 /W:2    -> 1 reintento con 2s de espera (evita bloqueos largos)
+#   /FFT         -> tolerancia de 2s en timestamps (multi-FS friendly)
+#   /NP          -> sin porcentaje (log más limpio)
+#   /NDL         -> sin listar directorios (menos ruido)
+#   /XD / /XF    -> exclusiones
+& robocopy $origen $destino `
+    /MIR /COPY:DAT /DCOPY:T /MT:16 /R:1 /W:2 /FFT /NP /NDL `
+    /XD $excludeDirs /XF $excludeFiles `
+    /LOG+:$log | Out-Null
+
+$exitCode = $LASTEXITCODE
+$resumen = Interpretar-ExitCode $exitCode
+
+# Decidir pausa y loguear según resultado
+if ($exitCode -ge 8) {
+    # Error grave
+    $erroresConsecutivos++
+    Write-Log "Ciclo #$ciclo finalizado (ExitCode=$exitCode): $resumen" "ERROR"
+    Write-Log "Errores consecutivos: $erroresConsecutivos" "WARN"
+    
+    if ($erroresConsecutivos -ge 5) {
+        Write-Log "5 errores consecutivos. Pausa extendida de 5 minutos." "WARN"
+        Start-Sleep -Seconds 300
+        $erroresConsecutivos = 0
+    } else {
+        Start-Sleep -Seconds $pausaTrasError
+    }
+}
+elseif ($exitCode -ge 1 -and $exitCode -lt 8) {
+    # Hubo cambios (copia o borrado)
+    $erroresConsecutivos = 0
+    Write-Log "Ciclo #$ciclo finalizado (ExitCode=$exitCode): $resumen"
+    Start-Sleep -Seconds $pausaTrasCambio
+}
+else {
+    # Sin cambios (código 0) - caso normal
+    $erroresConsecutivos = 0
+    # Log minimalista para no saturar
+    if ($ciclo % 20 -eq 0) {
+        Write-Log "Ciclo #$ciclo OK (sin cambios). Llevamos $ciclo ciclos."
+    }
+    Start-Sleep -Seconds $pausaNormal
+}
+}
+
+
+Descompon en pasos. Sin poner codigo. Dando descripciones detalladas. Lo que hace este script.
+
+Copilot said:
+Copilot
+1. Objetivo general del script
+
+Este script ejecuta una sincronización continua tipo espejo entre dos carpetas locales usando Robocopy.
+
+La carpeta de origen es:
+
+    carpeta-a
+
+La carpeta de destino es:
+
+    carpeta-b
+
+El comportamiento principal es:
+
+    Copiar al destino los archivos nuevos o modificados en el origen.
+    Eliminar del destino los archivos que ya no existen en el origen.
+    Mantener el destino como una réplica lo más exacta posible del origen.
+    Ejecutarse indefinidamente en ciclos.
+    Registrar actividad, errores y cambios en un fichero de log.
+    Adaptar las pausas entre ciclos según haya cambios, errores o ausencia de actividad.
+
+2. Configuración inicial
+2.1. Definición de rutas
+
+El script define tres rutas principales:
+
+    Origen
+        Carpeta principal desde la que se copiarán los datos.
+
+    Destino
+        Carpeta que recibirá la copia espejo.
+
+    Log
+        Archivo donde se registrará la actividad del script.
+        Se guarda en la carpeta Documents del perfil del usuario actual.
+
+2.2. Límite de tamaño del log
+
+Se define un tamaño máximo de log de 50 MB.
+
+Cuando el archivo de log supera ese tamaño:
+
+    Se renombra el log actual.
+    Se le añade una marca temporal al nombre.
+    Se crea un nuevo archivo de log vacío.
+    Se registra que ha ocurrido una rotación.
+
+Esto evita que el log crezca indefinidamente.
+3. Exclusiones configuradas
+
+El script excluye determinados directorios y archivos para evitar copiar metadatos, ficheros temporales o elementos propios de otros sistemas.
+3.1. Directorios excluidos
+
+Se excluyen carpetas asociadas a:
+Syncthing
+
+    .stfolder
+    .stversions
+
+Estas carpetas contienen metadatos internos de Syncthing y no deberían replicarse manualmente con Robocopy.
+Windows
+
+    $RECYCLE.BIN
+    System Volume Information
+
+Son directorios del sistema. Copiarlos puede producir errores, permisos denegados o inconsistencias.
+macOS
+
+    .Trashes
+    .Spotlight-V100
+    .fseventsd
+
+Son carpetas de metadatos utilizadas por macOS para papelera, indexación y eventos del sistema de archivos.
+3.2. Archivos excluidos
+
+Se excluyen archivos temporales o de metadatos:
+
+    Archivos temporales *.tmp
+    Archivos temporales que comienzan por ~
+    Thumbs.db
+    .DS_Store
+    desktop.ini
+    Bloqueos de FreeFileSync *.ffs_lock
+    Bases de datos de FreeFileSync *.ffs_db
+
+El objetivo es evitar sincronizar elementos que no forman parte del contenido real del usuario o que pueden generar conflictos.
+4. Configuración de pausas entre ciclos
+
+El script define tres tiempos de espera:
+4.1. Pausa normal
+
+    15 segundos
+    Se aplica cuando no hay cambios detectados.
+
+4.2. Pausa tras error
+
+    60 segundos
+    Se aplica cuando Robocopy devuelve un error grave.
+
+4.3. Pausa tras cambio
+
+    10 segundos
+    Se aplica después de detectar cambios, copias o eliminaciones.
+
+Esto permite que el script sea más reactivo cuando hay actividad y menos agresivo cuando no hay cambios.
+5. Función de escritura de log
+
+El script incluye una función dedicada a registrar mensajes en el log.
+
+Cada entrada del log contiene:
+
+    Fecha.
+    Hora.
+    Nivel del mensaje.
+    Texto descriptivo.
+
+Los niveles usados son principalmente:
+
+    INFO
+    WARN
+    ERROR
+
+Ejemplo conceptual de una entrada:
+
+    Fecha y hora.
+    Nivel informativo o de error.
+    Descripción del evento.
+
+Esta función centraliza el registro de actividad para que todo el script use el mismo formato.
+6. Función de rotación de log
+
+Antes de cada ciclo de sincronización, el script comprueba si el log supera los 50 MB.
+
+Si el tamaño se supera:
+
+    Comprueba que el archivo de log existe.
+    Calcula su tamaño.
+    Si excede el límite configurado:
+        Renombra el archivo actual.
+        Añade una marca temporal al nombre.
+        Lo conserva como archivo histórico.
+        Crea un nuevo log.
+        Registra el evento de rotación.
+
+Esto permite conservar trazabilidad sin mantener un único archivo demasiado grande.
+7. Función de interpretación del código de salida de Robocopy
+
+Robocopy no utiliza códigos de salida convencionales simples. Sus códigos funcionan como una máscara de bits.
+
+El script interpreta esos códigos y genera un resumen legible.
+7.1. Código 0
+
+Indica que no hubo cambios.
+
+Resultado interpretado:
+
+    Sin cambios.
+
+7.2. Código 1
+
+Indica que se copiaron archivos correctamente.
+
+Resultado interpretado:
+
+    Copiados OK.
+
+7.3. Código 2
+
+Indica que se detectaron elementos extra en destino.
+
+Con /MIR, normalmente implica que esos elementos pueden haber sido eliminados del destino para igualarlo al origen.
+
+Resultado interpretado:
+
+    Extras procesados.
+
+7.4. Código 4
+
+Indica discrepancias o inconsistencias.
+
+Resultado interpretado:
+
+    Mismatches.
+
+No siempre implica fallo crítico, pero requiere revisión.
+7.5. Código 8
+
+Indica fallos de copia.
+
+Resultado interpretado:
+
+    Fallos de copia.
+
+Este código ya se trata como error grave.
+7.6. Código 16
+
+Indica error fatal.
+
+Resultado interpretado:
+
+    Error fatal.
+
+Este es el nivel más grave.
+8. Validaciones iniciales
+
+Antes de iniciar la sincronización continua, el script comprueba las rutas.
+8.1. Validación del origen
+
+Si la carpeta de origen no existe:
+
+    Muestra un mensaje de error en consola.
+    Detiene la ejecución del script.
+    Sale con código de error.
+
+Esto impide ejecutar una sincronización destructiva desde una ruta inexistente.
+8.2. Validación del destino
+
+Si la carpeta de destino no existe:
+
+    Muestra un aviso en consola.
+    Crea la carpeta destino.
+    Continúa con la ejecución.
+
+Esto permite arrancar el proceso aunque el destino aún no haya sido creado.
+9. Inicialización del log
+
+Después de validar las rutas, el script prepara el archivo de log.
+
+Si el log no existe:
+
+    Crea un nuevo archivo.
+    Añade una cabecera inicial con fecha y hora.
+
+Después registra información estructural del servicio:
+
+    Inicio del servicio.
+    Ruta de origen.
+    Ruta de destino.
+    Directorios excluidos.
+    Archivos excluidos.
+
+Esta cabecera permite identificar con qué configuración se inició la sincronización.
+10. Inicialización de contadores internos
+
+Antes de entrar en el bucle principal, se crean dos contadores:
+10.1. Contador de ciclo
+
+Empieza en 0.
+
+Se incrementa en cada iteración del bucle.
+
+Sirve para saber cuántas sincronizaciones se han ejecutado desde el inicio del script.
+10.2. Contador de errores consecutivos
+
+Empieza en 0.
+
+Se incrementa cuando Robocopy devuelve un error grave.
+
+Se reinicia a 0 cuando un ciclo finaliza sin error grave.
+
+Permite aplicar una penalización mayor si hay errores repetidos.
+11. Bucle principal infinito
+
+El script entra en un bucle permanente.
+
+Esto significa que no ejecuta una única sincronización, sino que trabaja como un proceso continuo.
+
+En cada ciclo realiza las siguientes acciones:
+
+    Incrementa el número de ciclo.
+    Comprueba si debe rotar el log.
+    Registra el inicio del ciclo.
+    Ejecuta Robocopy.
+    Captura el código de salida.
+    Interpreta el resultado.
+    Decide qué registrar.
+    Decide cuánto tiempo esperar antes del siguiente ciclo.
+
+12. Ejecución de Robocopy
+
+En cada ciclo, el script lanza Robocopy con varios parámetros diseñados para una sincronización espejo robusta.
+12.1. Modo espejo
+
+El script usa un modo de sincronización que hace que el destino refleje el origen.
+
+Esto implica:
+
+    Copiar archivos nuevos.
+    Actualizar archivos modificados.
+    Eliminar del destino archivos que ya no existen en el origen.
+
+Punto crítico:
+
+    Si se borra algo en el origen, también se eliminará en el destino.
+    El destino no actúa como copia histórica, sino como réplica exacta.
+
+12.2. Copia de datos, atributos y fechas
+
+El script copia:
+
+    Datos del archivo.
+    Atributos.
+    Marcas temporales.
+
+No copia:
+
+    Propietario.
+    ACL de seguridad.
+    Información de auditoría.
+
+Esto reduce problemas de permisos, especialmente entre carpetas con distinto contexto de seguridad.
+12.3. Conservación de fechas en directorios
+
+El script preserva las marcas temporales de los directorios.
+
+Esto ayuda a mantener consistencia en la estructura replicada.
+12.4. Ejecución multihilo
+
+Robocopy se ejecuta con 16 hilos.
+
+Esto permite copiar varios archivos en paralelo.
+
+Ventajas:
+
+    Mayor rendimiento.
+    Mejor aprovechamiento de disco y CPU en copias con muchos archivos.
+
+Posible inconveniente:
+
+    Mayor carga de I/O.
+    Puede afectar al rendimiento del equipo si se ejecuta sobre discos lentos o ubicaciones de red.
+
+12.5. Reintentos limitados
+
+El script configura:
+
+    Un único reintento por archivo.
+    Dos segundos de espera entre intento y reintento.
+
+Esto evita que el proceso quede bloqueado durante demasiado tiempo por archivos abiertos, bloqueados o inaccesibles.
+12.6. Tolerancia de marcas temporales
+
+Se habilita tolerancia de dos segundos en timestamps.
+
+Esto es útil cuando intervienen distintos sistemas de archivos o herramientas que no almacenan las fechas con la misma precisión.
+
+Ejemplos:
+
+    NTFS.
+    FAT.
+    Recursos compartidos.
+    Sistemas sincronizados por otras herramientas.
+
+12.7. Reducción de ruido en el log
+
+El script evita registrar:
+
+    Porcentajes de progreso.
+    Listado completo de directorios.
+
+Esto mantiene el log más limpio y orientado a eventos relevantes.
+12.8. Aplicación de exclusiones
+
+Robocopy recibe las listas de:
+
+    Directorios excluidos.
+    Archivos excluidos.
+
+Por tanto, esos elementos no se copian ni se procesan durante la sincronización.
+12.9. Escritura en log
+
+La salida de Robocopy se añade al archivo de log existente.
+
+No se sobrescribe el log anterior en cada ejecución.
+
+Esto permite mantener trazabilidad de todos los ciclos.
+13. Captura del resultado de Robocopy
+
+Después de cada ejecución, el script lee el código de salida generado por Robocopy.
+
+Ese código se almacena internamente y se pasa a la función de interpretación.
+
+El objetivo es convertir un número técnico en un mensaje más comprensible.
+14. Tratamiento de errores graves
+
+Si el código de salida es 8 o superior, el script considera que ha ocurrido un error grave.
+
+Acciones realizadas:
+
+    Incrementa el contador de errores consecutivos.
+    Registra el ciclo como error.
+    Registra el número de errores consecutivos.
+    Decide la pausa antes del siguiente ciclo.
+
+14.1. Menos de 5 errores consecutivos
+
+Si todavía no se han alcanzado 5 errores seguidos:
+
+    El script espera 60 segundos.
+    Después intenta sincronizar de nuevo.
+
+14.2. Cinco errores consecutivos
+
+Si se alcanzan 5 errores consecutivos:
+
+    Registra una advertencia.
+    Aplica una pausa extendida de 5 minutos.
+    Reinicia el contador de errores consecutivos a 0.
+
+Esto evita ciclos agresivos en situaciones persistentes, como:
+
+    Destino desconectado.
+    Permisos incorrectos.
+    Archivos bloqueados.
+    Ruta inaccesible.
+    Error de disco.
+    Problemas de red si se adaptase a rutas UNC.
+
+15. Tratamiento de cambios detectados
+
+Si el código de salida está entre 1 y 7, el script interpreta que hubo actividad, pero no un error grave.
+
+Puede incluir:
+
+    Archivos copiados.
+    Archivos eliminados en destino por estar de más.
+    Diferencias menores.
+    Mismatches no críticos según el umbral configurado.
+
+Acciones realizadas:
+
+    Reinicia el contador de errores consecutivos.
+    Registra el resultado del ciclo.
+    Espera 10 segundos.
+    Inicia un nuevo ciclo.
+
+La pausa es menor que la normal para reaccionar con rapidez si sigue habiendo cambios.
+16. Tratamiento de ausencia de cambios
+
+Si el código de salida es 0, significa que origen y destino ya estaban sincronizados.
+
+Acciones realizadas:
+
+    Reinicia el contador de errores consecutivos.
+    No registra todos los ciclos para evitar saturar el log.
+    Solo registra un mensaje cada 20 ciclos.
+    Espera 15 segundos antes del siguiente ciclo.
+
+Esto reduce el volumen del log durante periodos de inactividad.
+17. Estrategia de logging
+
+El script combina dos tipos de registro:
+17.1. Registro propio del script
+
+Incluye eventos como:
+
+    Inicio del servicio.
+    Inicio de cada ciclo.
+    Resultado interpretado.
+    Errores consecutivos.
+    Rotación del log.
+    Pausas extendidas.
+
+17.2. Registro generado por Robocopy
+
+Incluye detalles propios de Robocopy:
+
+    Archivos copiados.
+    Archivos omitidos.
+    Errores específicos.
+    Estadísticas de copia.
+    Resultado operativo de cada ejecución.
+
+Ambos se escriben en el mismo archivo de log.
+18. Comportamiento práctico del sistema
+
+En ejecución normal, el flujo sería:
+
+    Se inicia el script.
+    Verifica que existe el origen.
+    Crea el destino si falta.
+    Crea o reutiliza el log.
+    Ejecuta Robocopy.
+    Si hay diferencias:
+        Copia, actualiza o elimina elementos.
+        Espera 10 segundos.
+    Si no hay diferencias:
+        Espera 15 segundos.
+    Si hay errores:
+        Espera 60 segundos.
+        Si se repiten 5 veces, espera 5 minutos.
+    Repite indefinidamente.
+
+19. Riesgo principal del script
+
+El punto más crítico es el uso de sincronización tipo espejo.
+
+El destino se fuerza a coincidir con el origen.
+
+Consecuencia directa:
+
+    Cualquier archivo eliminado en el origen será eliminado también en el destino.
+    Cualquier carpeta extra existente solo en destino será eliminada.
+    El destino no debe contener información exclusiva que se quiera conservar.
+
+Este script no es una solución de backup versionado. Es una réplica continua.
+20. Casos de uso adecuados
+
+Este script encaja bien para:
+
+    Replicación local entre dos carpetas.
+    Sincronización continua simple.
+    Laboratorios de pruebas.
+    Copia espejo controlada.
+    Entornos donde el origen es la única fuente válida.
+    Automatizaciones ligeras sin instalar servicios adicionales.
+
+21. Casos donde habría que tener precaución
+
+Debe usarse con cuidado si:
+
+    El destino contiene datos que no existen en origen.
+    El origen puede ser vaciado accidentalmente.
+    Hay ransomware o borrados masivos en origen.
+    Hay conflictos con otras herramientas de sincronización.
+    El destino está en red y puede desconectarse.
+    Se necesita historial de versiones.
+    Se requieren permisos NTFS completos.
+
+22. Evaluación técnica
+
+El script está orientado a robustez operativa básica:
+
+    Tiene validación inicial.
+    Registra eventos.
+    Excluye metadatos problemáticos.
+    Evita copiar permisos complejos.
+    Controla el crecimiento del log.
+    Tolera errores temporales.
+    No bloquea demasiado tiempo por archivos inaccesibles.
+    Reduce ruido en los registros.
+    Ajusta las pausas según el resultado.
+
+La lógica general es adecuada para una sincronización espejo continua, siempre que se asuma explícitamente que el destino es desechable frente al origen y que no se requiere versionado.
+You said:
+Este es el resultado despues de unos ajustes despues de probarlo. Opinion sincera.
+Copilot said:
+Copilot
+Opinión técnica sincera sobre sync-robocopy-1.0.5.txt
+
+El planteamiento conceptual ha mejorado respecto al enfoque inicial de espejo continuo: ahora el objetivo declarado es ingesta 24/7 tipo move hacia NAS, append-only, sin borrar nunca en destino, con single-instance, fail-closed, reintentos y notificación local. Esa arquitectura encaja mejor con un escenario de “cola local → repositorio NAS” que con /MIR, porque elimina el riesgo principal de una réplica espejo: propagación de borrados al destino.Text typesync-robocopy-1.0.5
+
+Sin embargo, el fichero actual no está listo para producción. La versión 1.0.5 parece más un esqueleto parcialmente migrado que un script funcional completo. Hay varios defectos estructurales que impedirían su ejecución correcta o dejarían sin implementar partes críticas.Text typesync-robocopy-1.0.5
+1. Lo que está bien planteado
+1.1. Cambio de modelo: de mirror a ingesta append-only
+
+El .SYNOPSIS y la descripción ya no hablan de espejo, sino de ingesta continua 24/7 con Robocopy en modo Move y Append-only, indicando explícitamente que no debe eliminarse nada en destino. Esto es una mejora importante si el destino es un NAS usado como repositorio final.Text typesync-robocopy-1.0.5
+
+Valoración: correcto como diseño funcional.
+1.2. Uso de ruta UNC para el NAS
+
+El destino está definido como:
+
+    \\NAS\\Repositorio
+
+Esto es coherente con un servicio o proceso 24/7, porque una ruta UNC es más predecible que una unidad mapeada dependiente de sesión de usuario.Text typesync-robocopy-1.0.5
+
+Valoración: correcto.
+1.3. Single-instance previsto
+
+El script intenta implementar exclusión mutua mediante un Mutex, con la intención de impedir que dos instancias trabajen sobre la misma cola de origen.Text typesync-robocopy-1.0.5
+
+Valoración: necesario y bien orientado, pero actualmente está incompleto por el problema del nombre del mutex.
+1.4. Variables de control operativas
+
+Hay parámetros configurables para:
+
+    pausa sin cambios;
+    pausa tras cambios;
+    pausa tras error;
+    máximo de errores consecutivos;
+    pausa ante error persistente;
+    tamaño máximo del log.Text typesync-robocopy-1.0.5
+
+Esto demuestra una intención correcta de controlar la ejecución en régimen continuo.
+
+Valoración: buena base de parametrización.
+1.5. Parada ordenada prevista
+
+Existe una variable global $global:IsRunning = $true y se intenta preparar la captura de Ctrl+C mediante TreatControlCAsInput.Text typesync-robocopy-1.0.5
+
+Valoración: bien planteado, pero aún no implementado de forma efectiva.
+2. Problemas críticos detectados
+2.1. El script está incompleto
+
+El bucle principal aparece vacío:
+
+    se define $CopyMode = "/COPYALL";
+    se entra en while ($global:IsRunning);
+    pero dentro del bucle no hay lógica de ejecución, validación, Robocopy, gestión de resultados ni pausas.Text typesync-robocopy-1.0.5
+
+Esto significa que, en su estado actual, el script:
+
+    no copia;
+    no mueve;
+    no valida continuamente el NAS;
+    no registra ciclos;
+    no aplica reintentos;
+    no aplica pausas adaptativas;
+    no procesa códigos de salida de Robocopy.
+
+Valoración: bloqueante.
+2.2. El MutexName no está correctamente definido
+
+Aparece una línea aislada:
+
+    ($SourceDir -replace '[\\:]','_')"
+
+Pero no se asigna a ninguna variable visible llamada $MutexName. Después, el script intenta crear el mutex usando $MutexName.Text typesync-robocopy-1.0.5
+
+Consecuencia probable:
+
+    $MutexName estará vacío o no definido;
+    el single-instance puede fallar;
+    puede haber comportamiento inesperado;
+    no se garantiza la exclusión por ruta de origen.
+
+Valoración: bloqueante.
+2.3. La función de logging no escribe en fichero
+
+La variable $LogFile existe, pero la función Write-Log solo hace salida por consola mediante Write-Host.Text typesync-robocopy-1.0.5
+
+Consecuencia:
+
+    no hay persistencia real de eventos;
+    no queda trazabilidad si se cierra la consola;
+    no se cumple el requisito operativo de log;
+    $MaxLogSizeMB queda sin uso práctico.
+
+Valoración: grave.
+2.4. No hay rotación de log implementada
+
+Está definido:
+
+    $MaxLogSizeMB = 10
+
+Pero no existe una función activa de rotación ni una llamada dentro del bucle.Text typesync-robocopy-1.0.5
+
+Consecuencia:
+
+    el límite de tamaño está declarado, pero no funciona;
+    no existe archivado de logs antiguos;
+    no hay control de crecimiento.
+
+Valoración: pendiente crítico para 24/7.
+2.5. Las validaciones devuelven $false, pero no $true
+
+La función Test-SyncPath devuelve $false si las rutas están vacías, pero no devuelve explícitamente $true si son válidas. Lo mismo ocurre con Test-NasAvailability: devuelve $false si falla Test-Path, pero no devuelve explícitamente $true cuando el destino existe.Text typesync-robocopy-1.0.5
+
+Consecuencia:
+
+    las validaciones pueden evaluarse como nulas;
+    pueden producir lógica ambigua;
+    el arranque podría detenerse aunque las rutas estén configuradas.
+
+Valoración: grave.
+2.6. No se valida que el origen exista
+
+La función Test-SyncPath solo comprueba si las rutas están vacías. No comprueba si la carpeta de origen existe físicamente.Text typesync-robocopy-1.0.5
+
+En un sistema de ingesta, esto es crítico.
+
+Debe diferenciarse entre:
+
+    ruta vacía;
+    ruta mal formada;
+    ruta no existente;
+    ruta existente pero sin permisos;
+    destino inaccesible;
+    destino accesible pero sin permisos de escritura.
+
+Valoración: insuficiente.
+2.7. La notificación popup está definida, pero no se usa
+
+Existe una función Show-Notification, pero no hay lógica que la invoque cuando el NAS está caído o tras cierto tiempo de desconexión.Text typesync-robocopy-1.0.5
+
+Además, el texto contiene secuencias como nn en vez de saltos de línea reales visibles en el contenido cargado, lo que sugiere un problema de escape/formato.Text typesync-robocopy-1.0.5
+
+Valoración: funcionalidad declarada pero no operativa.
+2.8. No hay ejecución real de Robocopy
+
+El script declara $CopyMode = "/COPYALL", pero no ejecuta Robocopy dentro del bucle.Text typesync-robocopy-1.0.5
+
+Además, si el objetivo es mover archivos sin borrar en destino, habría que ser muy preciso:
+
+    no usar /MIR;
+    no usar /PURGE;
+    no usar parámetros que borren extras del destino;
+    definir si se mueve con /MOV o /MOVE;
+    decidir si se eliminan directorios vacíos del origen;
+    decidir cuándo se considera segura la eliminación local tras copia correcta.
+
+Valoración: bloqueante.
+2.9. /COPYALL puede ser problemático contra NAS
+
+El script fija $CopyMode = "/COPYALL". Eso implica intención de copiar todos los metadatos, incluyendo seguridad, propietario y auditoría.Text typesync-robocopy-1.0.5
+
+En un NAS, esto puede fallar si:
+
+    el NAS no soporta ACL NTFS completas;
+    no hay permisos para escribir propietario;
+    no hay permisos para escribir SACL/auditoría;
+    el recurso SMB traduce permisos de forma limitada;
+    el usuario no tiene privilegios elevados.
+
+Valoración: arriesgado. Para NAS heterogéneo, suele ser más robusto copiar datos, atributos y fechas antes que intentar preservar todo.
+3. Problemas de coherencia con los requisitos
+3.1. Dice “Move, Append-only”, pero todavía no implementa el movimiento
+
+El encabezado afirma que el script mueve archivos desde una cola local hacia un NAS, pero no existe lógica de movimiento ni eliminación controlada del origen tras copia correcta.Text typesync-robocopy-1.0.5
+
+Valoración: incoherencia funcional.
+3.2. Dice “fail-closed”, pero aún no está materializado
+
+El concepto fail-closed implica que, ante duda, error o destino inaccesible, el script debe:
+
+    no borrar nada del origen;
+    no hacer operaciones destructivas;
+    registrar el error;
+    esperar;
+    reintentar;
+    alertar si persiste.
+
+La intención está en la descripción, pero no hay implementación efectiva dentro del bucle.Text typesync-robocopy-1.0.5
+
+Valoración: concepto correcto, ejecución ausente.
+3.3. Dice “reintentos progresivos”, pero solo hay variables
+
+Las variables de pausas y errores consecutivos están definidas, pero no se usan dentro de una lógica real.Text typesync-robocopy-1.0.5
+
+Valoración: pendiente de implementación.
+4. Estado real del script
+Calificación técnica actual
+
+Diseño conceptual: 7/10
+Implementación funcional: 2/10
+Preparado para producción: no
+Preparado para pruebas reales: no, salvo como plantilla
+Riesgo operativo si se ejecuta tal cual: alto por falsa sensación de protección
+5. Diagnóstico resumido
+
+El fichero tiene buena dirección, pero está en una fase intermedia. Ha dejado atrás el enfoque peligroso de espejo y se orienta hacia una ingesta append-only más segura. No obstante, ahora mismo le faltan las piezas esenciales:
+
+    nombre de mutex válido;
+    logging a fichero;
+    rotación real de log;
+    validaciones con retorno correcto;
+    comprobación de existencia y permisos;
+    comprobación de disponibilidad del NAS;
+    bucle operativo;
+    ejecución de Robocopy;
+    interpretación de exit codes;
+    lógica de movimiento seguro;
+    gestión de errores consecutivos;
+    notificación real;
+    parada ordenada efectiva.
+
+6. Recomendación directa
+
+No continuaría añadiendo funciones encima de esta versión sin antes corregir la estructura base.
+
+Prioridad recomendada:
+
+    Corregir la definición del mutex.
+    Hacer que las validaciones devuelvan resultados booleanos fiables.
+    Implementar logging persistente en $LogFile.
+    Añadir rotación de log.
+    Implementar comprobación real de origen, destino y permisos.
+    Construir el bucle operativo.
+    Ejecutar Robocopy sin parámetros destructivos sobre destino.
+    Procesar códigos de salida.
+    Eliminar del origen solo tras copia correcta.
+    Activar notificaciones solo tras error persistente, no en cada fallo puntual.
+
+La idea es buena. La versión actual no está endurecida todavía; está declarando endurecimiento, pero no lo ejecuta.
+Orígenes
+txt
+You said:
+podrias generar el codigo con las mejoras implementadas?
+Copilot said:
+Copilot
+Script PowerShell propuesto — sync-robocopy-1.0.6.ps1
+
+Basado en tu versión 1.0.5, corrige los puntos críticos detectados: MutexName real, logging persistente, rotación de log, validaciones booleanas, bucle operativo, ejecución real de Robocopy, tratamiento de exit codes, parada ordenada, control de NAS inaccesible, notificación diferida y modo append-only sin borrado en destino.Text typesync-robocopy-1.0.5
+PowerShell
+Cambios principales implementados
+
+    Eliminado cualquier comportamiento tipo espejo: no se usa /MIR, /PURGE ni borrado sobre destino.
+    Movimiento controlado con Robocopy mediante /MOV.
+    Modo append-only estricto con /XC, /XN y /XO.
+    Mutex funcional por ruta de origen.
+    Escritura real en fichero de log.
+    Rotación automática del log.
+    Validación explícita de configuración.
+    Validación de origen existente.
+    Validación recurrente de disponibilidad del NAS.
+    Popup solo tras caída persistente, con cooldown.
+    Parada ordenada mediante:
+        archivo .stop;
+        Ctrl+C en consola interactiva.
+    Gestión de errores consecutivos.
+    Pausas diferenciadas por:
+        sin cambios;
+        actividad;
+        error;
+        error persistente.
+
+Punto crítico operativo
+
+Con $StrictAppendOnly = $true, si un archivo ya existe en destino con el mismo nombre, Robocopy no lo sobrescribirá. Ese archivo puede quedarse pendiente en origen. Es el comportamiento correcto si el destino debe ser realmente append-only.
+
+Si prefieres que el destino pueda actualizar versiones existentes, cambia:
+PowerShell
+
+No lo recomiendo si el requisito es “nunca modificar ni borrar nada en destino”.
+Orígenes
+txt
+Enviar un mensaje a Copilot
+El contenido generado por IA puede ser incorrecto
